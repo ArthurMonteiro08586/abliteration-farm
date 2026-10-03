@@ -1,0 +1,10 @@
+# secrets & state
+accounts.jsonl
+keys.txt
+key_pool.json
+.env
+*.log
+*.png
+dump_*.html
+__pycache__/
+probe_cf*.log
