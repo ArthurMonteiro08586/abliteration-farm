@@ -91,6 +91,27 @@ class KeyPool:
                 return None
             return random.choice(alive)
 
+    def pick_order(self):
+        """Full ordered candidate list for exhaustive failover: keys with prior wins first,
+        then rest shuffled. Caller tries each once — no wasted attempts."""
+        with self.lock:
+            if time.time() - getattr(self, "_last_reload", 0) > 60:
+                self._reload_locked()
+                self._last_reload = time.time()
+            alive = [k for k in self.keys if k["status"] == "ok"]
+            if not alive:
+                now = time.time()
+                for k in self.keys:
+                    if k["status"] == "dead" and now - k["last_fail"] > 600:
+                        k["status"] = "ok"; k["fails"] = 0
+                    elif k["status"] == "nobalance" and now - k["last_fail"] > 1800:
+                        k["status"] = "ok"; k["fails"] = 0
+                alive = [k for k in self.keys if k["status"] == "ok"]
+            won = [k for k in alive if k.get("wins", 0) > 0]
+            rest = [k for k in alive if k.get("wins", 0) == 0]
+            random.shuffle(won); random.shuffle(rest)
+            return won + rest
+
     def _reload_locked(self):
         found = []
         for path, is_jsonl in ((KEYS_FILE, True), (os.path.join(BASE_DIR, "keys.txt"), False)):
@@ -141,6 +162,7 @@ class KeyPool:
             for k in self.keys:
                 if k["key"] == key:
                     k["fails"] = 0
+                    k["wins"] = k.get("wins", 0) + 1
                     if k["status"] != "dead":
                         k["status"] = "ok"
                     break
@@ -160,7 +182,7 @@ class KeyPool:
                 "ok": sum(1 for k in self.keys if k["status"] == "ok"),
                 "dead": sum(1 for k in self.keys if k["status"] == "dead"),
                 "nobalance": sum(1 for k in self.keys if k["status"] == "nobalance"),
-                "keys": [{"key": k["key"][:12] + "...", "status": k["status"], "fails": k["fails"]} for k in self.keys],
+                "keys": [{"key": k["key"][:12] + "...", "status": k["status"], "fails": k["fails"], "wins": k.get("wins", 0)} for k in self.keys],
             }
 
 
@@ -189,7 +211,7 @@ button:hover{border-color:#58a6ff}
   </div>
 </div>
 <h2>key pool</h2>
-<div class="card"><table id="keys"><tr><th>key</th><th>status</th><th>fails</th></tr></table>
+<div class="card"><table id="keys"><tr><th>key</th><th>status</th><th>wins</th><th>fails</th></tr></table>
 <button onclick="location.href='/admin/reload?k='+prompt('master key')">reload keys</button>
 <button onclick="refresh()">refresh</button></div>
 <h2>quick test</h2>
@@ -213,8 +235,8 @@ async function refresh(){
   const r = await fetch('/health'); const d = await r.json();
   total.textContent=d.total; ok.textContent=d.ok; nob.textContent=d.nobalance||0; dead.textContent=d.dead;
   const t=document.getElementById('keys');
-  t.innerHTML='<tr><th>key</th><th>status</th><th>fails</th></tr>'+d.keys.map(k=>
-    `<tr><td><code>${k.key}</code></td><td class="${k.status}">${k.status}</td><td>${k.fails}</td></tr>`).join('');
+  t.innerHTML='<tr><th>key</th><th>status</th><th>wins</th><th>fails</th></tr>'+d.keys.map(k=>
+    `<tr><td><code>${k.key}</code></td><td class="${k.status}">${k.status}</td><td>${k.wins||0}</td><td>${k.fails}</td></tr>`).join('');
 }
 async function testChat(){
   const out=document.getElementById('out'); out.textContent='sending...';
@@ -246,26 +268,19 @@ def upstream(path, method, body, key, timeout=180):
         return 599, json.dumps({"error": {"message": str(e), "type": "upstream_error"}}).encode(), {}
 
 
-def proxy_with_failover(path, method, body, max_tries=8):
-    tried = set()
+def proxy_with_failover(path, method, body):
+    """Exhaustive failover: try EVERY alive key once (winners first)."""
     last = (503, b'{"error":{"message":"no keys available"}}', {})
-    for _ in range(max_tries):
-        k = POOL.pick()
-        if not k:
-            break
-        if k["key"] in tried:
-            continue
-        tried.add(k["key"])
+    for k in POOL.pick_order():
         status, resp, hdrs = upstream(path, method, body, k["key"])
         if status < 400:
             POOL.mark_ok(k["key"])
             return status, resp, hdrs
         POOL.mark_fail(k["key"], status, resp)
         last = (status, resp, hdrs)
-        if b"insufficient_credits" in (resp or b""):
-            continue   # key without $1 credit — try next
-        if status in (400, 404, 422):   # client error not key-related
-            return status, resp, hdrs
+        if status in (400, 404, 422) and b"insufficient_credits" not in (resp or b""):
+            return status, resp, hdrs   # genuine client error, not key-related
+        # else (401/403/429/5xx/insufficient_credits) keep trying next key
     return last
 
 
@@ -354,15 +369,17 @@ class Handler(BaseHTTPRequestHandler):
             sub = p.replace("/v1", "")
             stream = bool(body.get("stream"))
             if stream:
-                # streaming passthrough
-                k = POOL.pick()
-                if not k:
-                    self._send(503, {"error": {"message": "no keys"}}); return
-                status, resp, hdrs = upstream(sub, "POST", body, k["key"], timeout=300)
-                if status >= 400:
+                # streaming: exhaustive key search, then forward body
+                status, resp, hdrs = 503, b'{"error":{"message":"no keys"}}', {}
+                used = None
+                for k in POOL.pick_order():
+                    status, resp, hdrs = upstream(sub, "POST", body, k["key"], timeout=300)
+                    if status < 400:
+                        POOL.mark_ok(k["key"]); used = k
+                        break
                     POOL.mark_fail(k["key"], status, resp)
+                if used is None:
                     self._send(status, resp); return
-                POOL.mark_ok(k["key"])
                 self.send_response(status)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
