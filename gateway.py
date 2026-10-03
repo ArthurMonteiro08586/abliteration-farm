@@ -166,6 +166,69 @@ class KeyPool:
 
 POOL = KeyPool()
 
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>abliteration farm gateway</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{background:#0d1117;color:#c9d1d9;font-family:ui-monospace,Consolas,monospace;margin:0;padding:24px}
+h1{color:#58a6ff;font-size:20px}h2{color:#8b949e;font-size:14px;text-transform:uppercase;margin-top:28px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin:10px 0}
+table{border-collapse:collapse;width:100%}td,th{padding:6px 10px;border-bottom:1px solid #21262d;text-align:left;font-size:13px}
+.ok{color:#3fb950}.dead{color:#f85149}.nobalance{color:#d29922}
+.big{font-size:28px;color:#58a6ff}code{background:#21262d;padding:2px 6px;border-radius:4px;font-size:12px}
+button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px 14px;cursor:pointer;font-family:inherit}
+button:hover{border-color:#58a6ff}
+</style></head><body>
+<h1>// abliteration farm gateway</h1>
+<div class="card">
+  <div style="display:flex;gap:40px">
+    <div><div class="big" id="total">-</div>keys total</div>
+    <div><div class="big ok" id="ok">-</div>ok (with credit)</div>
+    <div><div class="big nobalance" id="nob">-</div>awaiting review</div>
+    <div><div class="big dead" id="dead">-</div>dead</div>
+  </div>
+</div>
+<h2>key pool</h2>
+<div class="card"><table id="keys"><tr><th>key</th><th>status</th><th>fails</th></tr></table>
+<button onclick="location.href='/admin/reload?k='+prompt('master key')">reload keys</button>
+<button onclick="refresh()">refresh</button></div>
+<h2>quick test</h2>
+<div class="card">
+<input id="mk" placeholder="master key" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px;width:200px">
+<button onclick="testChat()">send chat</button>
+<pre id="out" style="white-space:pre-wrap;font-size:12px;color:#8b949e"></pre>
+</div>
+<h2>endpoints</h2>
+<div class="card"><table>
+<tr><td><code>POST /v1/chat/completions</code></td><td>OpenAI chat (stream supported)</td></tr>
+<tr><td><code>POST /v1/responses</code></td><td>OpenAI responses API</td></tr>
+<tr><td><code>POST /v1/messages</code></td><td>Anthropic-style messages</td></tr>
+<tr><td><code>POST /v1/messages/count_tokens</code></td><td>token counting</td></tr>
+<tr><td><code>GET /v1/models</code></td><td>model list</td></tr>
+<tr><td><code>GET /v1/credits</code> <code>/v1/organization/balance</code></td><td>billing passthrough</td></tr>
+<tr><td><code>GET /health</code> <code>GET /admin/keys</code></td><td>pool status</td></tr>
+</table></div>
+<script>
+async function refresh(){
+  const r = await fetch('/health'); const d = await r.json();
+  total.textContent=d.total; ok.textContent=d.ok; nob.textContent=d.nobalance||0; dead.textContent=d.dead;
+  const t=document.getElementById('keys');
+  t.innerHTML='<tr><th>key</th><th>status</th><th>fails</th></tr>'+d.keys.map(k=>
+    `<tr><td><code>${k.key}</code></td><td class="${k.status}">${k.status}</td><td>${k.fails}</td></tr>`).join('');
+}
+async function testChat(){
+  const out=document.getElementById('out'); out.textContent='sending...';
+  try{
+    const r=await fetch('/v1/chat/completions',{method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bea'+'rer '+document.getElementById('mk').value},
+      body:JSON.stringify({model:'abliterated-model',messages:[{role:'user',content:'Say hello'}],max_tokens:50})});
+    out.textContent=JSON.stringify(await r.json(),null,2).slice(0,2000);
+  }catch(e){out.textContent='ERR '+e}
+  refresh();
+}
+refresh(); setInterval(refresh,15000);
+</script></body></html>"""
+
 
 # ---------------------------------------------------------------- upstream call
 def upstream(path, method, body, key, timeout=180):
@@ -244,12 +307,25 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/health":
             self._send(200, {"status": "ok", "upstream": UPSTREAM, **POOL.stats()})
             return
+        if p == "/" or p == "/dashboard":
+            self._send(200, DASHBOARD_HTML, ctype="text/html; charset=utf-8")
+            return
         if p == "/admin/keys":
             if not self._auth_ok():
                 self._send(401, {"error": "unauthorized"}); return
             self._send(200, POOL.stats()); return
+        if p == "/admin/reload":
+            if not self._auth_ok():
+                self._send(401, {"error": "unauthorized"}); return
+            POOL.load()
+            self._send(200, POOL.stats()); return
         if p == "/v1/models":
             status, resp, hdrs = proxy_with_failover("/models", "GET", None)
+            self._send(status, resp); return
+        if p in ("/v1/credits", "/v1/organization", "/v1/organization/projects",
+                 "/v1/organization/balance", "/v1/organization/costs",
+                 "/v1/organization/usage/completions"):
+            status, resp, hdrs = proxy_with_failover(p.replace("/v1", ""), "GET", None)
             self._send(status, resp); return
         self._send(404, {"error": {"message": "not found", "path": p}})
 
@@ -273,7 +349,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"error": "key must start with sk-"})
             return
 
-        if p in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings"):
+        if p in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings",
+                 "/v1/responses", "/v1/messages", "/v1/messages/count_tokens"):
             sub = p.replace("/v1", "")
             stream = bool(body.get("stream"))
             if stream:
