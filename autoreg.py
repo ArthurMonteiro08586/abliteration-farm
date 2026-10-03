@@ -74,18 +74,38 @@ def stub_with_token(tok):
     return STUB_JS.replace("__TOKEN_PLACEHOLDER__", json.dumps(tok))
 
 # ---------------------------------------------------------------- helpers
-def voidash_inbox(domain="voidash.bond"):
-    body = json.dumps({"domain": domain}).encode()
-    req = urllib.request.Request("https://api.voidash.com/api/v1/inboxes", data=body,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        resp = json.loads(r.read().decode())
-    data = resp.get("data", resp)
-    sk = data.get("session_key") or data.get("sessionKey")
-    email = data.get("address") or data.get("email")
-    if not sk or not email:
-        raise RuntimeError("voidash bad resp: " + json.dumps(resp)[:200])
-    return email, sk
+# Voidash free domains — rotate to avoid one domain getting flagged by anti-fraud.
+# voidash.com is premium/paid (plan_required) — skip. cyou/bond tier2, eu.cc tier3.
+VOIDASH_DOMAINS = ["voidash.cyou", "govno.eu.cc", "musor.eu.cc", "pomoi.eu.cc", "voidash.bond"]
+_dom_i = 0
+
+def _next_domain():
+    global _dom_i
+    d = VOIDASH_DOMAINS[_dom_i % len(VOIDASH_DOMAINS)]
+    _dom_i += 1
+    return d
+
+def voidash_inbox(domain=None, tries=None):
+    """Create temp inbox. domain=None -> rotate across all free domains (with fallback)."""
+    tries = tries or (len(VOIDASH_DOMAINS) if domain is None else 1)
+    last_err = None
+    for _ in range(tries):
+        dom = domain or _next_domain()
+        body = json.dumps({"domain": dom}).encode()
+        req = urllib.request.Request("https://api.voidash.com/api/v1/inboxes", data=body,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                resp = json.loads(r.read().decode())
+        except Exception as e:
+            last_err = e; continue
+        data = resp.get("data", resp)
+        sk = data.get("session_key") or data.get("sessionKey")
+        email = data.get("address") or data.get("email")
+        if sk and email:
+            return email, sk
+        last_err = RuntimeError("voidash bad resp: " + json.dumps(resp)[:150])
+    raise RuntimeError(f"voidash all domains failed: {last_err}")
 
 def voidash_wait_code(sk, timeout=240):
     t0 = time.time()
@@ -139,8 +159,10 @@ async def run_one(idx, use_proxy=False, backends=None, pool=None):
     print(f"\n=== account {idx} ===")
 
     proxy_url = None
-    if use_proxy and pool is not None:
-        proxy_url = pool.next()
+    if use_proxy:
+        proxy_url = pool.next() if pool is not None else None
+        if not proxy_url:
+            raise RuntimeError("NO_PROXY: proxy pool empty/burned — home IP is blocked, refusing direct")
         print(f"[*] proxy: {proxy_url}")
 
     email, sk = voidash_inbox()
@@ -156,6 +178,8 @@ async def run_one(idx, use_proxy=False, backends=None, pool=None):
     browser_kwargs = {"headless": True, "humanize": False}
     if proxy_url:
         browser_kwargs["proxy"] = to_camoufox(proxy_url)
+        # NOTE: geoip=True crashes (camoufox hits ipecho.net THROUGH the proxy -> InvalidIP).
+        # Leave geoip off; NL/datacenter IP still passes the site (verified: sidecar solved OK).
 
     ok = False
     vok = False
@@ -362,7 +386,7 @@ async def main():
         print(f"[*] proxy pool: {len(pool) if pool else 0} proxies")
     oks = 0
     for i in range(1, n + 1):
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 if await run_one(i, use_proxy=use_proxy, backends=backends, pool=pool):
                     oks += 1
@@ -370,12 +394,20 @@ async def main():
             except SolverError as e:
                 print("  [!] captcha fail:", str(e)[:200])
                 break
+            except RuntimeError as e:
+                if "NO_PROXY" in str(e):
+                    print("  [!] no working proxies left — refresh proxies_verified.txt"); break
+                print(f"  [!] err (attempt {attempt+1}):", repr(e)[:200]); await asyncio.sleep(3)
             except Exception as e:
-                print(f"  [!] err (attempt {attempt+1}):", repr(e)[:250])
-                if use_proxy and pool is not None:
-                    p = pool.next()
-                    if p:
-                        pool.report_bad(p)
+                msg = repr(e)
+                # only burn the proxy on genuine network failures, not app-level denials
+                net_err = any(k in msg for k in ("NET_TIMEOUT", "ProxyError", "Tunnel connection",
+                            "ERR_CONNECTION", "ERR_TUNNEL", "InvalidIP", "NS_ERROR_NET"))
+                print(f"  [!] err (attempt {attempt+1}):", msg[:200], "(proxy burned)" if net_err else "")
+                if use_proxy and pool is not None and net_err:
+                    # mark the CURRENT proxy bad by re-picking deterministically is unreliable;
+                    # instead force a refresh so next attempt gets a fresh tested proxy
+                    pool._live_fetch()
                 await asyncio.sleep(3)
     print(f"\nDONE: ok={oks} total={n}")
 

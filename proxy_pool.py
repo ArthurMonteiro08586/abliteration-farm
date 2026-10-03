@@ -50,6 +50,7 @@ class ProxyPool:
     def __init__(self, path=None, only_good=True, refresh_sec=300):
         self.refresh_sec = refresh_sec
         self._last_live = 0.0
+        self.explicit = bool(path or os.environ.get("PROXY_FILE"))
         self.path = path or os.environ.get("PROXY_FILE")
         if not self.path:
             for cand in [os.path.join(HERE, "proxies.txt"),
@@ -66,6 +67,9 @@ class ProxyPool:
     def _live_fetch(self):
         """ProxyGrab API live fetch (tested against target site). Returns count added."""
         if os.environ.get("USE_PROXYGRAB", "1") != "1":
+            return 0
+        if self.explicit:   # PROXY_FILE set = exclusive, no live pollution
+            self._last_live = time.time()
             return 0
         try:
             from proxygrab import ProxyGrab
@@ -98,7 +102,7 @@ class ProxyPool:
             if p and p not in seen:
                 seen.add(p)
                 self.proxies.append(p)
-        if only_good:
+        if only_good and not self.explicit:   # explicit PROXY_FILE = that file ONLY
             gp = os.path.join(HERE, "proxies_good.txt")
             if os.path.exists(gp) and gp != self.path:
                 for line in open(gp, encoding="utf-8", errors="replace"):
