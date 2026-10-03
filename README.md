@@ -37,25 +37,29 @@ Voidash inbox -> 2captcha Turnstile (action=password_signup)
  -> 201 {secret_key: "ak_..."} -> accounts.jsonl
 ```
 
-## Credits / balance
+## Credits / balance — THE $1 STORY
 
-**No signup credit.** Proof from `/api/console/v1/rewards` on a verified account:
+**$1 signup credit EXISTS but is gated by manual review.** Proof from `/api/console/v1/rewards`:
 
+Most fresh accounts (4 of 5 tested):
 ```json
-{"eligible": false, "status": "review_required",
- "signup_credit_usd_micros": 0, "maximum_promotional_usd_micros": 0,
- "earned_promotional_usd_micros": 0,
- "social_bundle": {"amount_usd_micros": 500000, "status": "unavailable",
-                   "completed_steps": 0, "total_steps": 2,
-                   "x_completed": false, "linkedin_completed": false},
- "referrals": {"amount_each_usd_micros": 500000, "maximum_rewards": 0,
-               "rewarded_count": 0, "earned_usd_micros": 0}}
+{"eligible": false, "status": "review_required", "signup_credit_usd_micros": 0, ...}
 ```
 
-- `balance.available_usd_micros: 0`, plan `free`, billing state `blocked`
-- **$0.50** (500000 micros) available from **social bundle** — needs X + LinkedIn follow (2 steps)
-- **$0.50 per referral** — but `maximum_rewards: 0` for a fresh account (not enabled)
-- The `$1` on the pricing page is the **minimum custom prepaid top-up**, not a bonus
+But one account (registered ~14:16, checked ~15:00):
+```json
+{"eligible": true, "status": "available", "signup_credit_usd_micros": 1000000, ...}
+```
+= **$1.00 granted** (1000000 micros). Chat completion with its key returned **200 OK**, while keys of non-eligible accounts get `insufficient_credits`. So: the credit lands **asynchronously after anti-fraud review** (voidash.bond emails likely trigger it; some pass, some stay in review).
+
+Reward program (from console JS):
+- **Email verified** → $1 signup credit (auto-claimed when eligible; `review_required` = "Promotional-credit eligibility needs a support review")
+- **Social bundle** → $0.50 for following X + LinkedIn (`k.activate("x"|"linkedin")` mutations, needs real social auth)
+- **Referrals** → $0.50 each after referred user's first **paid** API request; `maximum_rewards: 0` on fresh accounts
+- Eligibility: "once per verified identity" — farm detection exists
+- The `$1` on the pricing page = minimum custom prepaid top-up, separate thing
+
+Balance check: `billing/summary` → `balance.available_usd_micros`.
 
 ## Setup
 
