@@ -73,25 +73,65 @@ class KeyPool:
 
     def pick(self):
         with self.lock:
-            alive = [k for k in self.keys if k["status"] != "dead"]
+            # auto-reload new keys from files every 60s
+            if time.time() - getattr(self, "_last_reload", 0) > 60:
+                self._reload_locked()
+                self._last_reload = time.time()
+            alive = [k for k in self.keys if k["status"] == "ok"]
             if not alive:
-                # revive all after cooldown
+                # revive dead after 600s, nobalance after 1800s (review may pass later)
                 now = time.time()
                 for k in self.keys:
                     if k["status"] == "dead" and now - k["last_fail"] > 600:
                         k["status"] = "ok"; k["fails"] = 0
-                alive = [k for k in self.keys if k["status"] != "dead"]
+                    elif k["status"] == "nobalance" and now - k["last_fail"] > 1800:
+                        k["status"] = "ok"; k["fails"] = 0
+                alive = [k for k in self.keys if k["status"] == "ok"]
             if not alive:
                 return None
             return random.choice(alive)
 
-    def mark_fail(self, key, code):
+    def _reload_locked(self):
+        found = []
+        for path, is_jsonl in ((KEYS_FILE, True), (os.path.join(BASE_DIR, "keys.txt"), False)):
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if is_jsonl:
+                            try:
+                                d = json.loads(line)
+                            except Exception:
+                                continue
+                            k = d.get("api_key")
+                        else:
+                            k = line
+                        if k and (k.startswith("sk-") or k.startswith("ak_")):
+                            found.append(k)
+            except Exception:
+                pass
+        added = 0
+        for k in found:
+            if not any(x["key"] == k for x in self.keys):
+                self.keys.append({"key": k, "status": "ok", "fails": 0, "last_fail": 0})
+                added += 1
+        if added:
+            print(f"[pool] hot-reload: +{added} keys (total {len(self.keys)})")
+            self._persist()
+
+    def mark_fail(self, key, code, body=b""):
         with self.lock:
             for k in self.keys:
                 if k["key"] == key:
                     k["fails"] += 1
                     k["last_fail"] = time.time()
-                    if code in (401, 403) or k["fails"] >= 4:
+                    if b"insufficient_credits" in (body or b""):
+                        k["status"] = "nobalance"   # $1 review not passed — skip, retry later
+                    elif code in (401, 403) or k["fails"] >= 4:
                         k["status"] = "dead"
                     break
             self._persist()
@@ -119,6 +159,7 @@ class KeyPool:
                 "total": len(self.keys),
                 "ok": sum(1 for k in self.keys if k["status"] == "ok"),
                 "dead": sum(1 for k in self.keys if k["status"] == "dead"),
+                "nobalance": sum(1 for k in self.keys if k["status"] == "nobalance"),
                 "keys": [{"key": k["key"][:12] + "...", "status": k["status"], "fails": k["fails"]} for k in self.keys],
             }
 
@@ -142,7 +183,7 @@ def upstream(path, method, body, key, timeout=180):
         return 599, json.dumps({"error": {"message": str(e), "type": "upstream_error"}}).encode(), {}
 
 
-def proxy_with_failover(path, method, body, max_tries=4):
+def proxy_with_failover(path, method, body, max_tries=8):
     tried = set()
     last = (503, b'{"error":{"message":"no keys available"}}', {})
     for _ in range(max_tries):
@@ -156,8 +197,10 @@ def proxy_with_failover(path, method, body, max_tries=4):
         if status < 400:
             POOL.mark_ok(k["key"])
             return status, resp, hdrs
-        POOL.mark_fail(k["key"], status)
+        POOL.mark_fail(k["key"], status, resp)
         last = (status, resp, hdrs)
+        if b"insufficient_credits" in (resp or b""):
+            continue   # key without $1 credit — try next
         if status in (400, 404, 422):   # client error not key-related
             return status, resp, hdrs
     return last
@@ -240,7 +283,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(503, {"error": {"message": "no keys"}}); return
                 status, resp, hdrs = upstream(sub, "POST", body, k["key"], timeout=300)
                 if status >= 400:
-                    POOL.mark_fail(k["key"], status)
+                    POOL.mark_fail(k["key"], status, resp)
                     self._send(status, resp); return
                 POOL.mark_ok(k["key"])
                 self.send_response(status)
