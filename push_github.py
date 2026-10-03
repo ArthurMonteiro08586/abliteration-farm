@@ -31,15 +31,18 @@ def api(method, path, token, body=None, tries=3):
             return last
     return last
 
-FILES = ["README.md", ".gitignore", "menu.py", "autoreg6.py", "gateway.py", "check_balances.py", "push_github.py"]
+FILES = ["README.md", ".gitignore", "menu.py", "autoreg6.py", "gateway.py", "check_balances.py", "push_github.py", "harvest_keys.py"]
 
 def main():
     tk, login = get_token()
     print("account:", login)
-    # init repo with README via Contents API (creates HEAD + main)
+    # init or update README via Contents API
     raw = open(os.path.join(HERE, "README.md"), "rb").read()
-    st, r = api("PUT", f"/repos/{login}/{REPO}/contents/README.md", tk,
-                {"message": "init", "content": base64.b64encode(raw).decode()})
+    st, ex = api("GET", f"/repos/{login}/{REPO}/contents/README.md", tk)
+    payload = {"message": "init", "content": base64.b64encode(raw).decode()}
+    if st == 200 and isinstance(ex, dict) and ex.get("sha"):
+        payload["sha"] = ex["sha"]
+    st, r = api("PUT", f"/repos/{login}/{REPO}/contents/README.md", tk, payload)
     print("init README:", st)
     if st not in (200, 201):
         raise SystemExit(str(r))
