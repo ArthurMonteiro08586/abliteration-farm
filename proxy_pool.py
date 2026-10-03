@@ -47,7 +47,9 @@ def to_camoufox(proxy_url):
     return d
 
 class ProxyPool:
-    def __init__(self, path=None, only_good=True):
+    def __init__(self, path=None, only_good=True, refresh_sec=300):
+        self.refresh_sec = refresh_sec
+        self._last_live = 0.0
         self.path = path or os.environ.get("PROXY_FILE")
         if not self.path:
             for cand in [os.path.join(HERE, "proxies.txt"),
@@ -61,10 +63,36 @@ class ProxyPool:
         self.bad = set()
         self._load(only_good)
 
+    def _live_fetch(self):
+        """ProxyGrab API live fetch (tested against target site). Returns count added."""
+        if os.environ.get("USE_PROXYGRAB", "1") != "1":
+            return 0
+        try:
+            from proxygrab import ProxyGrab
+            pg = ProxyGrab()
+            want = int(os.environ.get("PROXYGRAB_N", "8"))
+            proto = os.environ.get("PROXYGRAB_PROTO", "http")
+            test = os.environ.get("PROXYGRAB_TEST", "abliteration.ai")
+            live = pg.fetch(want, proto=proto, test=test or None)
+            added = 0
+            for p in live:
+                if p not in self.proxies:
+                    self.proxies.append(p)
+                    added += 1
+                self.bad.discard(p)   # freshly tested = give another chance
+            self._last_live = time.time()
+            if live:
+                print(f"[proxy] ProxyGrab: {len(live)} live (+{added} new, proto={proto}, test={test})")
+            return added
+        except Exception as e:
+            print(f"[proxy] ProxyGrab unavailable ({str(e)[:80]}) — files fallback")
+            return 0
+
     def _load(self, only_good):
+        self._live_fetch()
         if not self.path or not os.path.exists(self.path):
             return
-        seen = set()
+        seen = set(self.proxies)
         for line in open(self.path, encoding="utf-8", errors="replace"):
             p = parse_line(line)
             if p and p not in seen:
@@ -80,7 +108,14 @@ class ProxyPool:
                         self.proxies.insert(0, p)   # known-good first
 
     def next(self):
+        # refresh live proxies periodically (free ones die fast)
+        if self.refresh_sec and time.time() - self._last_live > self.refresh_sec:
+            self._live_fetch()
         alive = [p for p in self.proxies if p not in self.bad]
+        if not alive:
+            # everything burned -> force live refresh once
+            self._live_fetch()
+            alive = [p for p in self.proxies if p not in self.bad]
         if not alive:
             return None
         return random.choice(alive)

@@ -1,10 +1,12 @@
-# secrets & state
+# secrets and state
 accounts.jsonl
 keys.txt
 key_pool.json
 .env
+.proxygrab.json
+proxies.txt
+proxies_good.txt
 *.log
 *.png
 dump_*.html
 __pycache__/
-probe_cf*.log
